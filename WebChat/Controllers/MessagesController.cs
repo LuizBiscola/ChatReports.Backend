@@ -81,7 +81,9 @@ namespace ChatAppApi.Controllers
                     Status = message.Status
                 };
 
+                _logger.LogInformation($"🚨 BACKEND: Sending SignalR message to group 'chat_{chatId}': {messageData.Content}");
                 await _hubContext.Clients.Group($"chat_{chatId}").SendAsync("ReceiveMessage", messageData);
+                _logger.LogInformation($"✅ BACKEND: SignalR message sent successfully to group 'chat_{chatId}'");
 
                 _logger.LogInformation($"Message sent by user {request.SenderId} to chat {chatId}");
                 return CreatedAtAction(nameof(GetMessages), new { chatId = chatId }, message.ToDto());

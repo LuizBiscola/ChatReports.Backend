@@ -34,17 +34,22 @@ namespace ChatAppApi.Hubs
                     ConnectionId = Context.ConnectionId
                 };
 
+                _logger.LogInformation($"🔗 USER CONNECTED: {username} (ID: {userId}) connected with connection {Context.ConnectionId}");
+
                 // Get user's chats and join those groups
                 var userChats = await _chatService.GetUserChatsAsync(userId);
+                _logger.LogInformation($"📋 JOINING CHATS: User {username} will join {userChats.Count()} chat groups");
+                
                 foreach (var chat in userChats)
                 {
                     await Groups.AddToGroupAsync(Context.ConnectionId, $"chat_{chat.Id}");
+                    _logger.LogInformation($"✅ JOINED GROUP: User {username} joined group 'chat_{chat.Id}'");
                 }
 
                 // Notify others that user is online
                 await Clients.All.SendAsync("UserOnline", userId, username);
                 
-                _logger.LogInformation($"User {username} (ID: {userId}) connected with connection {Context.ConnectionId}");
+                _logger.LogInformation($"🟢 USER ONLINE: Notified all clients that {username} (ID: {userId}) is online");
             }
             catch (Exception ex)
             {
@@ -63,7 +68,11 @@ namespace ChatAppApi.Hubs
                     await Groups.AddToGroupAsync(Context.ConnectionId, $"chat_{chatId}");
                     await Clients.Group($"chat_{chatId}").SendAsync("UserJoinedChat", userConnection.UserId, userConnection.Username, chatId);
                     
-                    _logger.LogInformation($"User {userConnection.Username} joined chat {chatId}");
+                    _logger.LogInformation($"🔗 USER JOINED: {userConnection.Username} (ID: {userConnection.UserId}) joined chat group 'chat_{chatId}' with connection {Context.ConnectionId}");
+                }
+                else
+                {
+                    _logger.LogWarning($"❌ JOIN FAILED: Connection {Context.ConnectionId} not found in connections dictionary");
                 }
             }
             catch (Exception ex)
