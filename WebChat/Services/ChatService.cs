@@ -24,7 +24,20 @@ namespace ChatAppApi.Services
         {
             try
             {
-                return await _context.Users.FirstOrDefaultAsync(u => u.Username.ToLower() == username.ToLower());
+                var cacheKey = $"user_username_{username.ToLower()}";
+                if (_cache.TryGetValue(cacheKey, out User? cachedUser))
+                {
+                    return cachedUser;
+                }
+
+                var user = await _context.Users.FirstOrDefaultAsync(u => u.Username.ToLower() == username.ToLower());
+                
+                if (user != null)
+                {
+                    _cache.Set(cacheKey, user, _cacheExpiration);
+                }
+
+                return user;
             }
             catch (Exception ex)
             {
@@ -37,7 +50,20 @@ namespace ChatAppApi.Services
         {
             try
             {
-                return await _context.Users.FindAsync(userId);
+                var cacheKey = $"user_{userId}";
+                if (_cache.TryGetValue(cacheKey, out User? cachedUser))
+                {
+                    return cachedUser;
+                }
+
+                var user = await _context.Users.FindAsync(userId);
+                
+                if (user != null)
+                {
+                    _cache.Set(cacheKey, user, _cacheExpiration);
+                }
+
+                return user;
             }
             catch (Exception ex)
             {
@@ -50,7 +76,16 @@ namespace ChatAppApi.Services
         {
             try
             {
-                return await _context.Users.ToListAsync();
+                const string cacheKey = "all_users";
+                if (_cache.TryGetValue(cacheKey, out IEnumerable<User>? cachedUsers))
+                {
+                    return cachedUsers!;
+                }
+
+                var users = await _context.Users.OrderBy(u => u.Username).ToListAsync();
+                _cache.Set(cacheKey, users, TimeSpan.FromMinutes(5));
+                
+                return users;
             }
             catch (Exception ex)
             {
@@ -62,11 +97,24 @@ namespace ChatAppApi.Services
         // --- Chat Methods ---
         public async Task<Chat> CreateChatAsync(string name, List<int> participantIds)
         {
+            using var transaction = await _context.Database.BeginTransactionAsync();
             try
             {
                 if (participantIds.Count < 2)
                 {
                     throw new ArgumentException("A chat must have at least 2 participants");
+                }
+
+                // Validate all participants exist
+                var existingUsers = await _context.Users
+                    .Where(u => participantIds.Contains(u.Id))
+                    .Select(u => u.Id)
+                    .ToListAsync();
+
+                var missingUsers = participantIds.Except(existingUsers).ToList();
+                if (missingUsers.Any())
+                {
+                    throw new ArgumentException($"Users not found: {string.Join(", ", missingUsers)}");
                 }
 
                 // For direct chats (2 participants), check if a chat already exists
@@ -91,22 +139,22 @@ namespace ChatAppApi.Services
                 await _context.SaveChangesAsync();
 
                 // Add participants
+                var participants = participantIds.Select(userId => new ChatParticipant
+                {
+                    ChatId = newChat.Id,
+                    UserId = userId,
+                    JoinedAt = DateTime.UtcNow
+                }).ToList();
+
+                _context.ChatParticipants.AddRange(participants);
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                // Invalidate relevant caches
                 foreach (var userId in participantIds)
                 {
-                    var user = await _context.Users.FindAsync(userId);
-                    if (user != null)
-                    {
-                        var participant = new ChatParticipant
-                        {
-                            ChatId = newChat.Id,
-                            UserId = userId,
-                            JoinedAt = DateTime.UtcNow
-                        };
-                        _context.ChatParticipants.Add(participant);
-                    }
+                    _cache.Remove($"user_chats_{userId}");
                 }
-
-                await _context.SaveChangesAsync();
 
                 // Load the complete chat with participants
                 var completeChat = await GetChatByIdAsync(newChat.Id);
@@ -116,6 +164,7 @@ namespace ChatAppApi.Services
             }
             catch (Exception ex)
             {
+                await transaction.RollbackAsync();
                 _logger.LogError(ex, $"Error creating chat: {name}");
                 throw;
             }
@@ -135,6 +184,7 @@ namespace ChatAppApi.Services
                 var chat = await _context.Chats
                     .Include(c => c.Participants)
                         .ThenInclude(cp => cp.User)
+                    .AsNoTracking()
                     .FirstOrDefaultAsync(c => c.Id == chatId);
 
                 if (chat != null)
@@ -155,11 +205,21 @@ namespace ChatAppApi.Services
         {
             try
             {
-                return await _context.Chats
+                const string cacheKey = "all_chats";
+                if (_cache.TryGetValue(cacheKey, out IEnumerable<Chat>? cachedChats))
+                {
+                    return cachedChats!;
+                }
+
+                var chats = await _context.Chats
                     .Include(c => c.Participants)
                         .ThenInclude(cp => cp.User)
+                    .AsNoTracking()
                     .OrderByDescending(c => c.CreatedAt)
                     .ToListAsync();
+
+                _cache.Set(cacheKey, chats, TimeSpan.FromMinutes(5));
+                return chats;
             }
             catch (Exception ex)
             {
@@ -184,6 +244,7 @@ namespace ChatAppApi.Services
                     .Include(cp => cp.Chat)
                         .ThenInclude(c => c.Participants)
                             .ThenInclude(cp => cp.User)
+                    .AsNoTracking()
                     .Select(cp => cp.Chat)
                     .OrderByDescending(c => c.CreatedAt)
                     .ToListAsync();
@@ -203,11 +264,38 @@ namespace ChatAppApi.Services
         {
             try
             {
+                // Validate input
+                if (string.IsNullOrWhiteSpace(content))
+                {
+                    throw new ArgumentException("Message content cannot be empty");
+                }
+
+                if (content.Length > 4000)
+                {
+                    throw new ArgumentException("Message content is too long");
+                }
+
+                // Verify chat exists and user is participant
+                var chat = await _context.Chats
+                    .Include(c => c.Participants)
+                    .FirstOrDefaultAsync(c => c.Id == chatId);
+
+                if (chat == null)
+                {
+                    throw new ArgumentException($"Chat {chatId} not found");
+                }
+
+                var isParticipant = chat.Participants.Any(p => p.UserId == senderId);
+                if (!isParticipant)
+                {
+                    throw new UnauthorizedAccessException("User is not a participant in this chat");
+                }
+
                 var newMessage = new Message
                 {
                     ChatId = chatId,
                     SenderId = senderId,
-                    Content = content,
+                    Content = content.Trim(),
                     Timestamp = DateTime.UtcNow,
                     Status = "sent"
                 };
@@ -218,15 +306,12 @@ namespace ChatAppApi.Services
                 // Load the complete message with sender info
                 var completeMessage = await _context.Messages
                     .Include(m => m.Sender)
+                    .AsNoTracking()
                     .FirstOrDefaultAsync(m => m.Id == newMessage.Id);
 
                 // Invalidate cache for user chats (to update last message info if needed)
-                var chatParticipants = await _context.ChatParticipants
-                    .Where(cp => cp.ChatId == chatId)
-                    .Select(cp => cp.UserId)
-                    .ToListAsync();
-
-                foreach (var participantId in chatParticipants)
+                var participantIds = chat.Participants.Select(p => p.UserId).ToList();
+                foreach (var participantId in participantIds)
                 {
                     _cache.Remove($"user_chats_{participantId}");
                 }
@@ -245,21 +330,35 @@ namespace ChatAppApi.Services
         {
             try
             {
+                // Validate parameters
+                take = Math.Min(Math.Max(take, 1), 100); // Limit between 1 and 100
+                skip = Math.Max(skip, 0);
+
+                var cacheKey = $"chat_messages_{chatId}_{take}_{skip}_{beforeMessageId}";
+                if (_cache.TryGetValue(cacheKey, out IEnumerable<Message>? cachedMessages))
+                {
+                    return cachedMessages!;
+                }
+
                 IQueryable<Message> query = _context.Messages
                     .Where(m => m.ChatId == chatId)
-                    .Include(m => m.Sender);
+                    .Include(m => m.Sender)
+                    .AsNoTracking();
 
                 if (beforeMessageId.HasValue)
                 {
                     query = query.Where(m => m.Id < beforeMessageId.Value);
                 }
 
-                return await query
+                var messages = await query
                     .OrderByDescending(m => m.Timestamp)
                     .Skip(skip)
                     .Take(take)
                     .OrderBy(m => m.Timestamp) // Return in chronological order
                     .ToListAsync();
+
+                _cache.Set(cacheKey, messages, TimeSpan.FromMinutes(2));
+                return messages;
             }
             catch (Exception ex)
             {
@@ -272,10 +371,24 @@ namespace ChatAppApi.Services
         {
             try
             {
-                return await _context.Messages
+                var cacheKey = $"message_{messageId}";
+                if (_cache.TryGetValue(cacheKey, out Message? cachedMessage))
+                {
+                    return cachedMessage;
+                }
+
+                var message = await _context.Messages
                     .Include(m => m.Sender)
                     .Include(m => m.Chat)
+                    .AsNoTracking()
                     .FirstOrDefaultAsync(m => m.Id == messageId);
+
+                if (message != null)
+                {
+                    _cache.Set(cacheKey, message, _cacheExpiration);
+                }
+
+                return message;
             }
             catch (Exception ex)
             {
@@ -288,14 +401,23 @@ namespace ChatAppApi.Services
         {
             try
             {
+                var validStatuses = new[] { "sent", "delivered", "read" };
+                if (!validStatuses.Contains(status.ToLower()))
+                {
+                    throw new ArgumentException($"Invalid status: {status}");
+                }
+
                 var message = await _context.Messages.FindAsync(messageId);
                 if (message == null)
                 {
                     return false;
                 }
 
-                message.Status = status;
+                message.Status = status.ToLower();
                 await _context.SaveChangesAsync();
+
+                // Invalidate cache
+                _cache.Remove($"message_{messageId}");
 
                 _logger.LogInformation($"Updated message {messageId} status to {status}");
                 return true;
@@ -309,6 +431,7 @@ namespace ChatAppApi.Services
 
         public async Task<bool> AddUserToChatAsync(int chatId, int userId)
         {
+            using var transaction = await _context.Database.BeginTransactionAsync();
             try
             {
                 // Check if user is already a participant
@@ -320,6 +443,15 @@ namespace ChatAppApi.Services
                     return false; // User is already a participant
                 }
 
+                // Verify chat and user exist
+                var chatExists = await _context.Chats.AnyAsync(c => c.Id == chatId);
+                var userExists = await _context.Users.AnyAsync(u => u.Id == userId);
+
+                if (!chatExists || !userExists)
+                {
+                    return false;
+                }
+
                 var participant = new ChatParticipant
                 {
                     ChatId = chatId,
@@ -329,6 +461,7 @@ namespace ChatAppApi.Services
 
                 _context.ChatParticipants.Add(participant);
                 await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
 
                 // Invalidate cache
                 _cache.Remove($"chat_{chatId}");
@@ -339,6 +472,7 @@ namespace ChatAppApi.Services
             }
             catch (Exception ex)
             {
+                await transaction.RollbackAsync();
                 _logger.LogError(ex, $"Error adding user {userId} to chat {chatId}");
                 throw;
             }
@@ -346,6 +480,7 @@ namespace ChatAppApi.Services
 
         public async Task<bool> RemoveUserFromChatAsync(int chatId, int userId)
         {
+            using var transaction = await _context.Database.BeginTransactionAsync();
             try
             {
                 var participant = await _context.ChatParticipants
@@ -358,6 +493,7 @@ namespace ChatAppApi.Services
 
                 _context.ChatParticipants.Remove(participant);
                 await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
 
                 // Invalidate cache
                 _cache.Remove($"chat_{chatId}");
@@ -368,6 +504,7 @@ namespace ChatAppApi.Services
             }
             catch (Exception ex)
             {
+                await transaction.RollbackAsync();
                 _logger.LogError(ex, $"Error removing user {userId} from chat {chatId}");
                 throw;
             }
@@ -375,6 +512,7 @@ namespace ChatAppApi.Services
 
         public async Task<bool> DeleteChatAsync(int chatId, int requestingUserId)
         {
+            using var transaction = await _context.Database.BeginTransactionAsync();
             try
             {
                 // Get the chat with participants
@@ -394,40 +532,24 @@ namespace ChatAppApi.Services
                     throw new UnauthorizedAccessException("User is not authorized to delete this chat");
                 }
 
-                // For direct chats, only allow deletion if there are no messages or if user explicitly wants to delete
-                // For group chats, allow deletion by any participant but warn about message loss
                 var messageCount = await _context.Messages.CountAsync(m => m.ChatId == chatId);
-                
-                if (chat.Type == "direct" && messageCount > 0)
-                {
-                    _logger.LogWarning($"Deleting direct chat {chatId} with {messageCount} messages by user {requestingUserId}");
-                }
-                else if (chat.Type == "group" && messageCount > 0)
-                {
-                    _logger.LogWarning($"Deleting group chat {chatId} '{chat.Name}' with {messageCount} messages by user {requestingUserId}");
-                }
-
-                // Store participant IDs for cache invalidation
                 var participantIds = chat.Participants.Select(p => p.UserId).ToList();
 
+                _logger.LogInformation($"Deleting chat {chatId} (Type: {chat.Type}, Name: '{chat.Name}', Messages: {messageCount}) by user {requestingUserId}");
+
                 // Delete all messages first (due to foreign key constraints)
-                var messages = await _context.Messages.Where(m => m.ChatId == chatId).ToListAsync();
-                if (messages.Any())
+                if (messageCount > 0)
                 {
-                    _context.Messages.RemoveRange(messages);
+                    await _context.Messages.Where(m => m.ChatId == chatId).ExecuteDeleteAsync();
                 }
 
                 // Delete all participants
-                var participants = await _context.ChatParticipants.Where(cp => cp.ChatId == chatId).ToListAsync();
-                if (participants.Any())
-                {
-                    _context.ChatParticipants.RemoveRange(participants);
-                }
+                await _context.ChatParticipants.Where(cp => cp.ChatId == chatId).ExecuteDeleteAsync();
 
                 // Delete the chat itself
                 _context.Chats.Remove(chat);
-
                 await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
 
                 // Invalidate cache for all participants
                 foreach (var participantId in participantIds)
@@ -435,16 +557,19 @@ namespace ChatAppApi.Services
                     _cache.Remove($"user_chats_{participantId}");
                 }
                 _cache.Remove($"chat_{chatId}");
+                _cache.Remove("all_chats");
 
-                _logger.LogInformation($"Successfully deleted chat {chatId} (Type: {chat.Type}, Name: '{chat.Name}', Messages: {messageCount}) by user {requestingUserId}");
+                _logger.LogInformation($"Successfully deleted chat {chatId}");
                 return true;
             }
             catch (UnauthorizedAccessException)
             {
+                await transaction.RollbackAsync();
                 throw; // Re-throw authorization exceptions
             }
             catch (Exception ex)
             {
+                await transaction.RollbackAsync();
                 _logger.LogError(ex, $"Error deleting chat {chatId} by user {requestingUserId}");
                 throw;
             }
@@ -455,6 +580,12 @@ namespace ChatAppApi.Services
         {
             try
             {
+                var cacheKey = $"direct_chat_{Math.Min(userId1, userId2)}_{Math.Max(userId1, userId2)}";
+                if (_cache.TryGetValue(cacheKey, out Chat? cachedChat))
+                {
+                    return cachedChat;
+                }
+
                 // Find chats where both users are participants and it's a direct chat
                 var existingChat = await _context.Chats
                     .Where(c => c.Type == "direct")
@@ -463,7 +594,13 @@ namespace ChatAppApi.Services
                     .Where(c => c.Participants.Any(p => p.UserId == userId2))
                     .Include(c => c.Participants)
                         .ThenInclude(cp => cp.User)
+                    .AsNoTracking()
                     .FirstOrDefaultAsync();
+
+                if (existingChat != null)
+                {
+                    _cache.Set(cacheKey, existingChat, _cacheExpiration);
+                }
 
                 return existingChat;
             }

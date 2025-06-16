@@ -34,15 +34,30 @@ namespace ChatAppApi.Controllers
         {
             try
             {
-                // Validation
-                if (request == null || request.SenderId <= 0 || string.IsNullOrWhiteSpace(request.Content))
+                // Enhanced validation
+                if (request == null)
                 {
-                    return BadRequest("Invalid message data");
+                    return BadRequest("Request body is required");
                 }
 
-                if (request.Content.Length > 4000) // Reasonable message length limit
+                if (request.SenderId <= 0)
                 {
-                    return BadRequest("Message content is too long");
+                    return BadRequest("Valid sender ID is required");
+                }
+
+                if (string.IsNullOrWhiteSpace(request.Content))
+                {
+                    return BadRequest("Message content is required");
+                }
+
+                if (request.Content.Length > 4000)
+                {
+                    return BadRequest("Message content is too long (max 4000 characters)");
+                }
+
+                if (chatId <= 0)
+                {
+                    return BadRequest("Valid chat ID is required");
                 }
 
                 // Verify chat exists
@@ -69,7 +84,7 @@ namespace ChatAppApi.Controllers
                 // Persist the message
                 var message = await _chatService.AddMessageToChatAsync(chatId, request.SenderId, request.Content);
 
-                // Send real-time notification via SignalR
+                // Prepare message data for SignalR
                 var messageData = new
                 {
                     Id = message.Id,
@@ -81,12 +96,31 @@ namespace ChatAppApi.Controllers
                     Status = message.Status
                 };
 
-                _logger.LogInformation($"🚨 BACKEND: Sending SignalR message to group 'chat_{chatId}': {messageData.Content}");
-                await _hubContext.Clients.Group($"chat_{chatId}").SendAsync("ReceiveMessage", messageData);
-                _logger.LogInformation($"✅ BACKEND: SignalR message sent successfully to group 'chat_{chatId}'");
+                // Send real-time notification via SignalR
+                try
+                {
+                    _logger.LogInformation($"🚨 BACKEND: Sending SignalR message to group 'chat_{chatId}': {messageData.Content}");
+                    await _hubContext.Clients.Group($"chat_{chatId}").SendAsync("ReceiveMessage", messageData);
+                    _logger.LogInformation($"✅ BACKEND: SignalR message sent successfully to group 'chat_{chatId}'");
+                }
+                catch (Exception signalREx)
+                {
+                    _logger.LogError(signalREx, $"Failed to send SignalR message for chat {chatId}");
+                    // Don't fail the request if SignalR fails, message is already persisted
+                }
 
                 _logger.LogInformation($"Message sent by user {request.SenderId} to chat {chatId}");
                 return CreatedAtAction(nameof(GetMessages), new { chatId = chatId }, message.ToDto());
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogWarning(ex, $"Unauthorized message attempt by user {request?.SenderId} to chat {chatId}");
+                return Forbid(ex.Message);
+            }
+            catch (ArgumentException ex)
+            {
+                _logger.LogWarning(ex, $"Invalid message data for chat {chatId}");
+                return BadRequest(ex.Message);
             }
             catch (Exception ex)
             {
@@ -106,6 +140,11 @@ namespace ChatAppApi.Controllers
             try
             {
                 // Validate parameters
+                if (chatId <= 0)
+                {
+                    return BadRequest("Valid chat ID is required");
+                }
+
                 if (take <= 0 || take > 100)
                 {
                     take = 50; // Default and max limit
@@ -126,7 +165,10 @@ namespace ChatAppApi.Controllers
                 // Get messages
                 var messages = await _chatService.GetChatMessagesAsync(chatId, take, skip, beforeMessageId);
                 
-                return Ok(messages.Select(m => m.ToDto()));
+                var messageDtos = messages.Select(m => m.ToDto()).ToList();
+                
+                _logger.LogInformation($"Retrieved {messageDtos.Count} messages for chat {chatId}");
+                return Ok(messageDtos);
             }
             catch (Exception ex)
             {
@@ -141,6 +183,11 @@ namespace ChatAppApi.Controllers
         {
             try
             {
+                if (chatId <= 0 || messageId <= 0)
+                {
+                    return BadRequest("Valid chat ID and message ID are required");
+                }
+
                 var message = await _chatService.GetMessageByIdAsync(messageId);
                 if (message == null || message.ChatId != chatId)
                 {
@@ -162,25 +209,41 @@ namespace ChatAppApi.Controllers
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(request.Status))
+                if (chatId <= 0 || messageId <= 0)
+                {
+                    return BadRequest("Valid chat ID and message ID are required");
+                }
+
+                if (request == null || string.IsNullOrWhiteSpace(request.Status))
                 {
                     return BadRequest("Status is required");
                 }
 
                 var validStatuses = new[] { "sent", "delivered", "read" };
-                if (!validStatuses.Contains(request.Status.ToLower()))
+                var normalizedStatus = request.Status.ToLower();
+                
+                if (!validStatuses.Contains(normalizedStatus))
                 {
-                    return BadRequest("Invalid status. Valid statuses are: sent, delivered, read");
+                    return BadRequest($"Invalid status. Valid statuses are: {string.Join(", ", validStatuses)}");
                 }
 
-                var success = await _chatService.UpdateMessageStatusAsync(messageId, request.Status);
+                var success = await _chatService.UpdateMessageStatusAsync(messageId, normalizedStatus);
                 if (!success)
                 {
                     return NotFound($"Message with ID {messageId} not found");
                 }
 
                 // Notify via SignalR
-                await _hubContext.Clients.Group($"chat_{chatId}").SendAsync("MessageStatusUpdated", messageId, request.Status);
+                try
+                {
+                    await _hubContext.Clients.Group($"chat_{chatId}").SendAsync("MessageStatusUpdated", messageId, normalizedStatus);
+                    _logger.LogInformation($"Message {messageId} status updated to {normalizedStatus} and notified via SignalR");
+                }
+                catch (Exception signalREx)
+                {
+                    _logger.LogError(signalREx, $"Failed to send SignalR status update for message {messageId}");
+                    // Don't fail the request if SignalR fails, status is already updated
+                }
 
                 return NoContent();
             }
